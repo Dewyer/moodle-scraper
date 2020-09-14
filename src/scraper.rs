@@ -12,6 +12,7 @@ pub fn start_scrape()
 	println!("Hello, Moodle!");
 
 	let mut client = MoodleClient::new().unwrap();
+	println!("Scraping for {}",dotenv!("BME_USERNAME"));
 	client.login().expect("Couldn't login to moodle !");
 
 	let ld = client.get_loaded_state().expect("Should log in.");

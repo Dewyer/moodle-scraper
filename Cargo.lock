@@ -619,7 +619,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "moodle-scraper"
+name = "moodlescraper"
 version = "0.1.0"
 dependencies = [
  "dotenv",

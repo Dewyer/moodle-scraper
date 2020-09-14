@@ -41,6 +41,7 @@ impl MoodleClient
 			.user_agent(dotenv!("USER_AGENT"))
 			.cookie_store(true)
 			.redirect(redirect::Policy::limited(10))
+			.danger_accept_invalid_certs(true)
 			.build().map_err(|_| MoodleClientError::FailedToCreateClient)?;
 
 		Ok(Self {
@@ -73,13 +74,13 @@ impl MoodleClient
 	{
 		self.client.get(Url::parse("https://edu.vik.bme.hu/login/index.php").unwrap())
 			.send()
-			.map_err(|_| MoodleClientError::RequestError)?;
+			.map_err(|e| error::request_error_fromr_reqe(e))?;
 
 		utils::blocking_sleep(SLEEP_BETWEEN_PAGES);
 
 		self.client.get(Url::parse("https://edu.vik.bme.hu/auth/shibboleth/index.php").unwrap())
 			.send()
-			.map_err(|_| MoodleClientError::RequestError)?;
+			.map_err(|e| error::request_error_fromr_reqe(e))?;
 
 		Ok(())
 	}
@@ -104,7 +105,7 @@ impl MoodleClient
 		let login_second_resp = self.client.post(Url::parse(&login_second_url).unwrap())
 			.form(&login_second_form)
 			.send()
-			.map_err(|_| MoodleClientError::RequestError)?;
+			.map_err(|e| error::request_error_fromr_reqe(e))?;
 
 		if !login_second_resp.status().is_success()
 		{
@@ -132,7 +133,7 @@ impl MoodleClient
 		let login_resp = self.client.post(Url::parse("https://login.bme.hu/idp/Authn/UserPassword").unwrap())
 			.form(&login_bme_form)
 			.send()
-			.map_err(|_| MoodleClientError::RequestError)?;
+			.map_err(|e| error::request_error_fromr_reqe(e))?;
 
 		if !login_resp.status().is_success()
 		{
@@ -195,7 +196,7 @@ impl MoodleClient
 
 	pub fn scrape_course_page(&self,course:&MoodleCourse) -> Result<Vec<MoodleCourseActivity>,MoodleClientError>
 	{
-		let resp = self.client.get(&course.url).send().map_err(|_| MoodleClientError::RequestError)?;
+		let resp = self.client.get(&course.url).send().map_err(|e| error::request_error_fromr_reqe(e))?;
 		let dom = Self::get_dom_from_response(resp)?;
 
 		let choice_links_selector = scraper::Selector::parse(".activityinstance>.aalink[href*=\"/mod/choice\"]").unwrap();

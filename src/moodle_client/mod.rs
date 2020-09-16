@@ -3,7 +3,7 @@ pub mod models;
 
 use reqwest::blocking::Client;
 use self::error::MoodleClientError;
-use reqwest::{Url, redirect};
+use reqwest::{Url, redirect, StatusCode};
 use reqwest::blocking::{Response};
 use std::collections::HashMap;
 use crate::utils;
@@ -18,10 +18,18 @@ pub enum MoodleState
 	NotLoggedIn,
 }
 
+#[derive(Eq, PartialEq,Debug)]
+pub enum ChoiceResult
+{
+	AlreadySelected,
+	Full,
+	Success
+}
+
 pub struct MoodleClient
 {
 	client: Client,
-	pub state: MoodleState
+	pub state: MoodleState,
 }
 
 #[derive(Debug)]
@@ -46,7 +54,7 @@ impl MoodleClient
 
 		Ok(Self {
 			client,
-			state: MoodleState::NotLoggedIn
+			state: MoodleState::NotLoggedIn,
 		})
 	}
 
@@ -91,7 +99,7 @@ impl MoodleClient
 		Ok(scraper::Html::parse_document(&body_txt))
 	}
 
-	fn do_bme_login_nojs_post(&mut self, login_dom: &scraper::Html) -> Result<(), MoodleClientError>
+	fn do_bme_login_nojs_post(&self, login_dom: &scraper::Html) -> Result<MoodleState, MoodleClientError>
 	{
 		let relay_state = Self::get_element_attr_val_by_selector(&login_dom, "input[name=\"RelayState\"]", "value")?;
 		let saml_response = Self::get_element_attr_val_by_selector(&login_dom, "input[name=\"SAMLResponse\"]", "value")?;
@@ -116,15 +124,13 @@ impl MoodleClient
 		let username = Self::get_current_username(&login_second_dom)?;
 		let courses = Self::get_courses(&login_second_dom)?;
 
-		self.state = MoodleState::LoggedIn(MoodleLoadedState {
+		Ok(MoodleState::LoggedIn(MoodleLoadedState {
 			username,
 			courses,
-		});
-
-		Ok(())
+		}))
 	}
 
-	pub fn do_bme_login(&mut self) -> Result<(), MoodleClientError>
+	pub fn do_bme_login(&self) -> Result<MoodleState, MoodleClientError>
 	{
 		let mut login_bme_form = HashMap::new();
 		login_bme_form.insert("j_username", dotenv!("BME_USERNAME"));
@@ -147,12 +153,19 @@ impl MoodleClient
 
 	pub fn login(&mut self) -> Result<(), MoodleClientError>
 	{
+		let new_state = self.get_new_state_after_login()?;
+		self.state = new_state;
+		Ok(())
+	}
+
+	fn get_new_state_after_login(&self) -> Result<MoodleState, MoodleClientError>
+	{
 		self.get_to_bme_login()?;
 		utils::blocking_sleep(SLEEP_BETWEEN_PAGES);
-		self.do_bme_login()?;
+		let res = self.do_bme_login()?;
 		utils::blocking_sleep(SLEEP_BETWEEN_PAGES);
 
-		Ok(())
+		Ok(res)
 	}
 
 	fn dump_html_for_test(html: String, name: &str)
@@ -194,10 +207,9 @@ impl MoodleClient
 		Ok(res)
 	}
 
-	pub fn scrape_course_page(&self,course:&MoodleCourse) -> Result<Vec<MoodleCourseActivity>,MoodleClientError>
+	pub fn scrape_course_page(&self, course: &MoodleCourse) -> Result<Vec<MoodleCourseActivity>, MoodleClientError>
 	{
-		let resp = self.client.get(&course.url).send().map_err(|e| error::request_error_fromr_reqe(e))?;
-		let dom = Self::get_dom_from_response(resp)?;
+		let dom = self.load_dom_with_ensured_session(&course.url)?;
 
 		let choice_links_selector = scraper::Selector::parse(".activityinstance>.aalink[href*=\"/mod/choice\"]").unwrap();
 		let choice_instancenames_selector = scraper::Selector::parse(".activityinstance>.aalink[href*=\"/mod/choice\"]>.instancename").unwrap();
@@ -215,13 +227,112 @@ impl MoodleClient
 		for link_index in 0..choice_links.len()
 		{
 			let link = choice_links[link_index].value().attr("href").ok_or(MoodleClientError::DataNotFound)?.to_string();
-			let name:String = choice_names[link_index].text().collect::<Vec<_>>().join("");
-			actv.push(MoodleCourseActivity{
+			let name: String = choice_names[link_index].text().collect::<Vec<_>>().join("");
+			actv.push(MoodleCourseActivity {
 				name,
-				url:link
+				url: link,
 			})
 		}
 
 		Ok(actv)
+	}
+
+	fn single_select_dom_element<'a>(dom: &'a scraper::Html, selector: &'a str) -> Option<scraper::ElementRef<'a>>
+	{
+		let selector = scraper::Selector::parse(selector).ok()?;
+		dom.select(&selector).next()
+	}
+
+	fn logged_out_info_on_page(dom: &scraper::Html) -> bool
+	{
+		let login_info = Self::single_select_dom_element(dom, ".logininfo");
+		if let Some(element) = login_info
+		{
+			return element.inner_html().contains("not logged in");
+		}
+
+		false
+	}
+
+	pub fn load_dom_with_ensured_session(&self, url: &str) -> Result<scraper::Html, MoodleClientError>
+	{
+		for _ in 0..3
+		{
+			let resp = self.client.get(url).send().map_err(|e| error::request_error_fromr_reqe(e))?;
+			let dom = Self::get_dom_from_response(resp)?;
+			if Self::logged_out_info_on_page(&dom)
+			{
+				self.get_new_state_after_login();
+			} else {
+				return Ok(dom);
+			}
+
+			utils::blocking_sleep(4000);
+		}
+
+		Err(MoodleClientError::LoginError)
+	}
+
+	pub fn get_form_data_for_form(dom: &scraper::Html, form_inputs_selector: &str) -> HashMap<String, String>
+	{
+		let selector = scraper::selector::Selector::parse(form_inputs_selector)
+			.unwrap();
+		let mut form: HashMap<String,String> = HashMap::new();
+		let form_inputs = dom.select(&selector);
+
+		for form_input in form_inputs
+		{
+			let val = form_input.value().attr("value");
+			if val.is_none()
+			{
+				continue;
+			}
+			let val = val.unwrap().to_string();
+
+			if let Some(name_val) = form_input.value().attr("name")
+			{
+				if !form.contains_key(name_val)
+				{
+					form.insert(name_val.to_string(), val);
+				}
+			}
+		}
+
+		form
+	}
+
+	pub fn select_option_on_activity(&self, activity: &MoodleCourseActivity, choice_index: i32) -> Result<ChoiceResult, MoodleClientError>
+	{
+		let dom = self.load_dom_with_ensured_session(&activity.url)?;
+
+		let choice_form = format!("#choice_{}", choice_index);
+		let choice_inp = Self::single_select_dom_element(&dom, &choice_form)
+			.ok_or(MoodleClientError::DataNotFound)?;
+
+		if choice_inp.value().attr("disabled").is_some()
+		{
+			return Ok(ChoiceResult::Full);
+		}
+		if choice_inp.value().attr("checked").is_some()
+		{
+			return Ok(ChoiceResult::AlreadySelected);
+		}
+
+		//Otherwise WEE HOOO
+		let mut choice_form_data: HashMap<String, String> = Self::get_form_data_for_form(&dom, "form[action*=\"mod/choice\"] input");
+		choice_form_data.remove("answer");
+		choice_form_data.insert("answer".to_string(),choice_inp.value().attr("value").ok_or(MoodleClientError::DataNotFound)?.to_string());
+
+		let resp = self.client.post("https://edu.vik.bme.hu/mod/choice/view.php")
+			.form(&choice_form_data)
+			.send()
+			.map_err(|er| error::request_error_fromr_reqe(er))?;
+
+		if resp.status() != StatusCode::OK
+		{
+			return Err(MoodleClientError::RequestError);
+		}
+
+		Ok(ChoiceResult::Success)
 	}
 }
